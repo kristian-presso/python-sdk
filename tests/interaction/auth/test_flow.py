@@ -10,7 +10,7 @@ makes is observable via `on_request`.
 
 import json
 from collections import Counter
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import anyio
 import httpx2
@@ -31,6 +31,7 @@ from tests.interaction.auth._harness import (
     auth_settings,
     connect_with_oauth,
     oauth_client_metadata,
+    record_requests,
     shimmed_app,
 )
 from tests.interaction.auth._provider import InMemoryAuthorizationServerProvider
@@ -213,6 +214,41 @@ async def test_the_dcr_request_carries_the_client_metadata() -> None:
     assert storage.client_info.client_id is not None
     assert storage.client_info.client_secret is not None
     assert list(provider.clients) == [storage.client_info.client_id]
+
+
+@requirement("client-auth:user-agent-forwarded")
+async def test_every_oauth_request_carries_the_user_agent_set_on_the_http_client() -> None:
+    """A User-Agent set on the `httpx2.AsyncClient` reaches every request of the OAuth flow, including
+    the token refresh, not just the MCP requests (regression lock-in for #1664).
+
+    The provider issues an already-expired first token so the flow also takes the refresh path.
+    """
+    recorded, on_request = record_requests()
+    provider = InMemoryAuthorizationServerProvider(issue_expired_first=True)
+    server = Server("guarded", on_list_tools=list_tools)
+
+    with anyio.fail_after(5):
+        async with connect_with_oauth(
+            server, provider=provider, headers={"User-Agent": "my-app/1.0"}, on_request=on_request
+        ) as (client, _):
+            await client.list_tools()
+
+    oauth_requests = [
+        (r.method, r.path, dict(parse_qsl(r.content.decode())).get("grant_type"), r.headers.get("user-agent"))
+        for r in recorded
+        if r.path != "/mcp"
+    ]
+    assert oauth_requests == snapshot(
+        [
+            ("GET", "/.well-known/oauth-protected-resource/mcp", None, "my-app/1.0"),
+            ("GET", "/.well-known/oauth-authorization-server", None, "my-app/1.0"),
+            ("POST", "/register", None, "my-app/1.0"),
+            ("GET", "/authorize", None, "my-app/1.0"),
+            ("POST", "/token", "authorization_code", "my-app/1.0"),
+            ("POST", "/token", "refresh_token", "my-app/1.0"),
+        ]
+    )
+    assert {r.headers.get("user-agent") for r in recorded if r.path == "/mcp"} == {"my-app/1.0"}
 
 
 async def test_shimmed_app_serves_overrides_404s_and_otherwise_forwards_to_the_wrapped_app() -> None:

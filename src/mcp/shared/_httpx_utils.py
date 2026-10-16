@@ -196,7 +196,8 @@ class RedirectAwareAuth(ABC, httpx2.Auth):
     drives it and, for each request the flow makes other than the one being
     authenticated, follows a redirect that `next_request_within_origin` accepts,
     up to `_AUTH_REDIRECT_LIMIT` times. Any other redirect response is handed
-    to the flow as it is.
+    to the flow as it is. Each request the flow makes also gets the User-Agent
+    of the request being authenticated, unless the flow set one itself.
     """
 
     @abstractmethod
@@ -207,7 +208,12 @@ class RedirectAwareAuth(ABC, httpx2.Auth):
         flow = self._auth_flow(request)
         try:
             outgoing = await flow.__anext__()
+            # The client merges its headers into `request` only; requests the flow builds carry none,
+            # and servers behind WAF or bot rules reject a request with no User-Agent.
+            user_agent = request.headers.get("User-Agent")
             while True:
+                if outgoing is not request and user_agent is not None:
+                    outgoing.headers.setdefault("User-Agent", user_agent)
                 response = yield outgoing
                 if outgoing is not request:
                     for _ in range(_AUTH_REDIRECT_LIMIT):

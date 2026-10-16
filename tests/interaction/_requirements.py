@@ -3979,6 +3979,16 @@ REQUIREMENTS: dict[str, Requirement] = {
             "elsewhere into the auth provider's state, so the absence cannot be observed end to end."
         ),
     ),
+    "client-auth:user-agent-forwarded": Requirement(
+        source="issue:#1664",
+        behavior=(
+            "Every request the OAuth client makes during the flow (metadata discovery, registration, token "
+            "exchange and refresh) carries the User-Agent configured on the HTTP client, which httpx2 merges "
+            "into the MCP request only."
+        ),
+        transports=("streamable-http",),
+        note="OAuth is HTTP-only.",
+    ),
     "client-auth:identity-assertion": Requirement(
         source="sdk",
         behavior=(

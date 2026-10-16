@@ -7,6 +7,7 @@ import httpx2
 import pytest
 
 from mcp.shared._httpx_utils import (
+    RedirectAwareAuth,
     create_mcp_http_client,
     request_within_origin,
     sse_within_origin,
@@ -283,3 +284,85 @@ async def test_auth_flow_requests_are_not_redirected():
 
     assert response.text == "307"
     assert received == ["POST http://mcp.example/token", "POST http://mcp.example/mcp"]
+
+
+class _TokenThenRequest(RedirectAwareAuth):
+    """Sends a token request the flow builds itself (with `token_headers`), then the request being authenticated."""
+
+    def __init__(self, token_headers: dict[str, str] | None = None) -> None:
+        self._token_headers = token_headers
+
+    async def _auth_flow(self, request: httpx2.Request) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
+        yield httpx2.Request("POST", "http://mcp.example/token", headers=self._token_headers, content=b"grant")
+        yield request
+
+
+def _header_recording_client(
+    auth: httpx2.Auth, redirects: dict[str, str] | None = None, **client_kwargs: Any
+) -> tuple[httpx2.AsyncClient, dict[str, httpx2.Headers]]:
+    """A client whose server answers 307 to each path in `redirects` (path to Location) and 200 to
+    anything else; plus the headers the server received, by path."""
+    seen: dict[str, httpx2.Headers] = {}
+
+    def serve(request: httpx2.Request) -> httpx2.Response:
+        seen[request.url.path] = request.headers
+        if redirects is not None and request.url.path in redirects:
+            return httpx2.Response(307, headers={"location": redirects[request.url.path]})
+        return httpx2.Response(200)
+
+    return httpx2.AsyncClient(transport=httpx2.MockTransport(serve), auth=auth, **client_kwargs), seen
+
+
+async def test_auth_flow_requests_carry_the_user_agent_of_the_request_being_authenticated():
+    """A request a `RedirectAwareAuth` flow builds itself gets the client's User-Agent, which httpx2
+    merges into the request being authenticated only (SDK behaviour, issue #1664). No other header
+    of that request is copied."""
+    client, seen = _header_recording_client(
+        _TokenThenRequest(), headers={"User-Agent": "my-app/1.0", "X-Tenant": "acme"}
+    )
+    async with client:
+        await request_within_origin(
+            client, "POST", "http://mcp.example/mcp", headers={"Authorization": "Bearer old", "mcp-session-id": "s1"}
+        )
+
+    assert seen["/token"]["user-agent"] == "my-app/1.0"
+    assert "x-tenant" not in seen["/token"]
+    assert "authorization" not in seen["/token"]
+    assert "mcp-session-id" not in seen["/token"]
+    assert seen["/mcp"]["user-agent"] == "my-app/1.0"
+
+
+async def test_a_user_agent_the_auth_flow_sets_itself_is_not_overwritten():
+    """A User-Agent the flow put on its own request wins over the client's."""
+    client, seen = _header_recording_client(
+        _TokenThenRequest(token_headers={"User-Agent": "flow/2.0"}), headers={"User-Agent": "my-app/1.0"}
+    )
+    async with client:
+        await request_within_origin(client, "POST", "http://mcp.example/mcp")
+
+    assert seen["/token"]["user-agent"] == "flow/2.0"
+
+
+async def test_a_redirect_the_auth_flow_follows_keeps_the_forwarded_user_agent():
+    """A same-origin redirect `RedirectAwareAuth` follows for a flow request is sent with the
+    User-Agent forwarded to that request."""
+    client, seen = _header_recording_client(
+        _TokenThenRequest(), redirects={"/token": "/oauth/token"}, headers={"User-Agent": "my-app/1.0"}
+    )
+    async with client:
+        await request_within_origin(client, "POST", "http://mcp.example/mcp")
+
+    assert seen["/token"]["user-agent"] == "my-app/1.0"
+    assert seen["/oauth/token"]["user-agent"] == "my-app/1.0"
+
+
+async def test_auth_flow_requests_get_no_user_agent_when_the_request_being_authenticated_has_none():
+    """With no User-Agent on the request being authenticated there is nothing to forward, so a flow
+    request goes out without one, as before."""
+    client, seen = _header_recording_client(_TokenThenRequest())
+    del client.headers["User-Agent"]
+    async with client:
+        await request_within_origin(client, "POST", "http://mcp.example/mcp")
+
+    assert "user-agent" not in seen["/mcp"]
+    assert "user-agent" not in seen["/token"]

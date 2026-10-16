@@ -418,6 +418,7 @@ async def connect_with_oauth(
     verify_tokens: bool = True,
     app_shim: Callable[[ASGIApp], ASGIApp] | None = None,
     on_request: Callable[[httpx2.Request], None] | None = None,
+    headers: Mapping[str, str] | None = None,
     mode: str = "legacy",
     read_timeout_seconds: float | None = None,
     json_response: bool = False,
@@ -432,7 +433,8 @@ async def connect_with_oauth(
     (state mismatch, error redirects). `verify_tokens=False` mounts the MCP endpoint without
     the bearer middleware so a flow driven by a shimmed 401 completes regardless of the granted
     scopes. `app_shim` wraps the built Starlette app before it reaches the bridge transport,
-    for tests that need to intercept or rewrite specific server responses.
+    for tests that need to intercept or rewrite specific server responses. `headers` are set on
+    the `httpx2.AsyncClient`, the way a user configures headers for the MCP requests.
 
     `auth`: supply a pre-built `httpx2.Auth` (such as `ClientCredentialsOAuthProvider`) to use
     instead of constructing the default `OAuthClientProvider`; in that case `storage`,
@@ -480,7 +482,11 @@ async def connect_with_oauth(
         await stack.enter_async_context(server.session_manager.run())
         http_client = await stack.enter_async_context(
             httpx2.AsyncClient(
-                transport=StreamingASGITransport(app), base_url=BASE_URL, auth=oauth, event_hooks=event_hooks
+                transport=StreamingASGITransport(app),
+                base_url=BASE_URL,
+                auth=oauth,
+                event_hooks=event_hooks,
+                headers=headers,
             )
         )
         headless.bind(http_client)
